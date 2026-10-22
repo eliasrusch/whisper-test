@@ -28,6 +28,10 @@ label{display:flex;flex-direction:column;gap:4px;flex:1 1 150px;min-width:0;
   font-family:var(--mono);font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mute)}
 select{font:inherit;font-family:var(--sans);font-size:.95rem;text-transform:none;letter-spacing:0;color:var(--ink);
   background:var(--card);border:1px solid var(--rule);border-radius:2px;padding:10px;min-height:44px;width:100%}
+textarea{font:inherit;font-family:var(--mono);font-size:.9rem;text-transform:none;letter-spacing:0;color:var(--ink);
+  background:var(--card);border:1px solid var(--rule);border-radius:2px;padding:10px;width:100%;resize:vertical;min-height:56px}
+textarea:focus-visible{outline:2px solid var(--violet);outline-offset:2px}
+.hint{margin:-6px 0 0;font-family:var(--mono);font-size:.7rem;line-height:1.5;color:var(--mute)}
 button{font:inherit;font-family:var(--sans);font-size:1rem;font-weight:500;cursor:pointer;min-height:48px;
   border:1px solid var(--ink);background:transparent;color:var(--ink);border-radius:2px;padding:0 16px}
 button:focus-visible,select:focus-visible{outline:2px solid var(--violet);outline-offset:2px}
@@ -63,8 +67,10 @@ button:disabled{opacity:.45;cursor:default}
   <div class="row">
     <label>Modell
       <select id="model">
-        <option value="base">Base, genauer (~100 MB)</option>
-        <option value="tiny">Tiny, schneller (~40 MB)</option>
+        <option value="small" selected>Small, empfohlen (~250 MB)</option>
+        <option value="turbo">Large-v3-Turbo, beste Qualität (~900 MB, nur GPU)</option>
+        <option value="base">Base (~100 MB)</option>
+        <option value="tiny">Tiny, schnellster (~40 MB)</option>
       </select>
     </label>
     <label>Sprache
@@ -77,6 +83,11 @@ button:disabled{opacity:.45;cursor:default}
       </select>
     </label>
   </div>
+
+  <label>Fachbegriffe (kommagetrennt)
+    <textarea id="terms" rows="2" spellcheck="false" placeholder="cAMP, GPCR, Adenylylcyclase, G-Protein"></textarea>
+  </label>
+  <p class="hint">Whisper kann keinen Kontext vorgeben. Stattdessen wird jedes Wort der Ausgabe, das ähnlich klingt wie ein Begriff hier, auf diese Schreibweise korrigiert.</p>
 
   <button id="go" disabled>Modell laden</button>
   <div class="bar" id="bar" hidden><i id="barfill"></i></div>
@@ -93,7 +104,18 @@ button:disabled{opacity:.45;cursor:default}
 import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2/+esm";
 env.allowLocalModels = false;
 let asr = null, busy = false;
-const IDS = { tiny: "onnx-community/whisper-tiny", base: "onnx-community/whisper-base" };
+const IDS = {
+  tiny: "onnx-community/whisper-tiny",
+  base: "onnx-community/whisper-base",
+  small: "onnx-community/whisper-small",
+  turbo: "onnx-community/whisper-large-v3-turbo",
+};
+const GPU_DTYPE = {
+  tiny:  { encoder_model: "fp32", decoder_model_merged: "q4" },
+  base:  { encoder_model: "fp32", decoder_model_merged: "q4" },
+  small: { encoder_model: "fp32", decoder_model_merged: "q4" },
+  turbo: { encoder_model: "fp16", decoder_model_merged: "q4" },
+};
 
 async function pickDevice() {
   try {
@@ -110,11 +132,9 @@ self.onmessage = async (e) => {
   if (m.type === "load") {
     try {
       const device = await pickDevice();
-      const dtype = device === "webgpu"
-        ? { encoder_model: "fp32", decoder_model_merged: "q4" }
-        : "q8";
       let key = m.model;
-      if (device === "wasm" && key === "base") key = "base"; // still allowed, just slower
+      if (device === "wasm" && key === "turbo") key = "small"; // too heavy without GPU
+      const dtype = device === "webgpu" ? GPU_DTYPE[key] : "q8";
       const files = {};
       asr = await pipeline("automatic-speech-recognition", IDS[key], {
         device, dtype,
@@ -238,6 +258,60 @@ function tick() {
   tick.pending = { id, end: total, from };
 }
 
+/* ---- glossary correction (GLOSSARY-START) ---- */
+let glossary = [];
+function sKey(s) {
+  return s.toLowerCase().replace(/ph/g, "f").replace(/th/g, "t").replace(/[ck]/g, "k").replace(/y/g, "i")
+    .replace(/[^a-z0-9äöüß]/g, "").replace(/(.)\1+/g, "$1");
+}
+function lev(a, b) {
+  const m = a.length, n = b.length; if (!m) return n; if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[n];
+}
+function parseTerms(str) {
+  return str.split(/[,;\n]/).map((s) => s.trim()).filter((s) => s.length >= 2)
+    .map((term) => ({ term, key: sKey(term) })).filter((g) => g.key.length >= 2);
+}
+function tolerance(len) { return len <= 4 ? 0 : len <= 8 ? 1 : 2; }
+function findTerm(k) {
+  for (const g of glossary) {
+    const d = lev(k, g.key);
+    if (d === 0 || (d <= tolerance(g.key.length) && k[0] === g.key[0])) return g.term;
+  }
+  return null;
+}
+function applyGlossary(text) {
+  if (!glossary.length || !text) return text;
+  const w = text.split(/\s+/).filter(Boolean).map((tok) => {
+    const m = tok.match(/^([^\p{L}\p{N}]*)(.*?)([^\p{L}\p{N}]*)$/u);
+    return { pre: m[1], core: m[2], post: m[3] };
+  });
+  const out = [];
+  for (let i = 0; i < w.length;) {
+    let hit = null, used = 1;
+    for (let n = Math.min(5, w.length - i); n >= 1 && !hit; n--) {
+      let ok = true;
+      for (let j = 0; j < n - 1; j++) if (w[i + j].post) ok = false;   // no punctuation inside a phrase
+      if (!ok) continue;
+      const k = sKey(w.slice(i, i + n).map((x) => x.core).join(""));
+      if (k.length < 2) continue;
+      let t = findTerm(k), plural = false;
+      if (!t && k.length > 3 && k.endsWith("s")) { t = findTerm(k.slice(0, -1)); plural = !!t; }
+      if (t) { hit = (plural && !/s$/i.test(t) ? t + "s" : t); used = n; }
+    }
+    if (hit) { out.push(w[i].pre + hit + w[i + used - 1].post); i += used; }
+    else { out.push(w[i].pre + w[i].core + w[i].post); i++; }
+  }
+  return out.join(" ");
+}
+/* ---- glossary correction (GLOSSARY-END) ---- */
+
 function clean(t) {
   return t.replace(/\[(BLANK_AUDIO|MUSIC|Music)\]|\(.*?(Musik|music).*?\)/g, "").trim();
 }
@@ -246,7 +320,7 @@ function onResult(m) {
   inflight = false;
   if (!tick.pending || tick.pending.id !== m.id) return;
   const { end } = tick.pending;
-  const text = clean(m.text);
+  const text = applyGlossary(clean(m.text));
   liveText = text;
   // Commit when the window is long, or when the last ~0.8 s are quiet after a decent stretch of speech.
   const windowLen = end - committedAt;
@@ -323,6 +397,12 @@ $("clear").onclick = () => { doneText = ""; liveText = ""; committedAt = total; 
 $("copy").onclick = async () => {
   const t = (doneText + " " + liveText).trim(); if (!t) return;
   try { await navigator.clipboard.writeText(t); status("Kopiert"); } catch (e) { err("Kopieren nicht möglich."); }
+};
+try { $("terms").value = localStorage.getItem("wl-terms") || ""; } catch (e) {}
+glossary = parseTerms($("terms").value);
+$("terms").oninput = () => {
+  glossary = parseTerms($("terms").value);
+  try { localStorage.setItem("wl-terms", $("terms").value); } catch (e) {}
 };
 $("go").disabled = false;
 render();
